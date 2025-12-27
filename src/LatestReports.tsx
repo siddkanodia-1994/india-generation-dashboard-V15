@@ -9,9 +9,8 @@ type NewsItem = {
   snippet: string;
 };
 
-const CACHE_KEY = "latestReports_cache_v2";
+const CACHE_KEY = "latestReports_cache_v3";
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
-
 const MIN_DATE = "2015-01-01";
 
 const POWER_TERMS = [
@@ -53,9 +52,9 @@ const COMPANY_FILTERS: { label: string; patterns: string[] }[] = [
   { label: "All", patterns: [] },
   { label: "NTPC", patterns: ["ntpc"] },
   { label: "Tata Power", patterns: ["tata power", "tatapower"] },
-  { label: "Power Grid", patterns: ["power grid", "powergrid", "pgcil", "pgi l", "pgcil"] },
+  { label: "Power Grid", patterns: ["power grid", "powergrid", "pgcil"] },
   { label: "Adani Power", patterns: ["adani power", "adanipower"] },
-  { label: "Adani Green", patterns: ["adani green", "adani renew", "adanigreen"] },
+  { label: "Adani Green", patterns: ["adani green", "adanigreen", "adani renew"] },
   { label: "REC", patterns: ["rec", "rural electrification corporation"] },
   { label: "PFC", patterns: ["pfc", "power finance corporation"] },
   { label: "NHPC", patterns: ["nhpc"] },
@@ -128,7 +127,6 @@ function isRelevantReport(item: NewsItem) {
   const mentionsReport =
     REPORT_TERMS.some((t) => hay.includes(t)) ||
     BROKER_TERMS.some((t) => hay.includes(t));
-
   return mentionsIndia && mentionsPower && mentionsReport;
 }
 
@@ -154,16 +152,25 @@ function saveCache(items: NewsItem[]) {
   }
 }
 
-async function fetchGoogleNewsRSS(): Promise<NewsItem[]> {
-  // Query tuned to brokerage research and analyst reports on Indian power names
-  const q = `(India (power OR electricity OR energy OR renewable OR grid) (report OR research OR initiation OR coverage OR analyst OR "target price" OR rating OR upgrade OR downgrade OR "buy" OR "sell" OR "hold") (NTPC OR "Tata Power" OR "Power Grid" OR "Adani Power" OR REC OR PFC OR NHPC OR "JSW Energy"))`;
+function normalizeUrl(u: string) {
+  try {
+    const url = new URL(u);
+    url.hash = "";
+    ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid"].forEach(
+      (k) => url.searchParams.delete(k)
+    );
+    return url.toString();
+  } catch {
+    return u;
+  }
+}
 
+async function fetchRSSQuery(query: string): Promise<NewsItem[]> {
   const rss =
     "https://news.google.com/rss/search?q=" +
-    encodeURIComponent(q) +
+    encodeURIComponent(query) +
     "&hl=en-IN&gl=IN&ceid=IN:en";
 
-  // ✅ AllOrigins proxy (browser-safe on Vercel)
   const proxy = `https://api.allorigins.win/raw?url=${encodeURIComponent(rss)}`;
 
   const res = await fetch(proxy);
@@ -179,24 +186,51 @@ async function fetchGoogleNewsRSS(): Promise<NewsItem[]> {
       const link = item.querySelector("link")?.textContent?.trim() || "";
       const pubDate = item.querySelector("pubDate")?.textContent?.trim() || "";
       const source = item.querySelector("source")?.textContent?.trim() || "Google News";
-
-      const desc = (
-        item.querySelector("description")?.textContent || ""
-      ).replace(/<[^>]+>/g, "");
+      const desc = (item.querySelector("description")?.textContent || "").replace(/<[^>]+>/g, "");
 
       const publishedAtISO = pubDate ? new Date(pubDate).toISOString() : "";
       if (!title || !link || !publishedAtISO) return null;
 
       return {
-        id: `${publishedAtISO}_${i}`,
+        id: `${publishedAtISO}_${i}_${title.slice(0, 20)}`,
         title,
-        url: link,
+        url: normalizeUrl(link),
         source,
         publishedAtISO,
         snippet: clamp(desc, 200),
       } as NewsItem;
     })
     .filter(Boolean) as NewsItem[];
+}
+
+async function fetchReportsMultiQuery(): Promise<NewsItem[]> {
+  const queries: string[] = [
+    // broad brokerage report query
+    '(India (power OR electricity OR energy OR renewable OR grid) (report OR research OR initiation OR coverage OR analyst OR "target price" OR rating OR upgrade OR downgrade))',
+    // company-oriented
+    '(India (NTPC OR "Tata Power" OR "Power Grid" OR "Adani Power" OR REC OR PFC OR NHPC OR IREDA OR "JSW Energy") (report OR research OR analyst OR "target price" OR rating))',
+    // broker mentions (publicly indexed)
+    '(India (power OR energy) ("Motilal Oswal" OR "ICICI Securities" OR "JM Financial" OR "Nuvama" OR "Ambit" OR "Elara" OR "Axis Securities") (report OR research OR note))',
+    // renewables focus
+    '(India (renewable OR solar OR wind OR storage OR battery) (report OR research OR initiation OR coverage) (power OR energy))',
+  ];
+
+  const results = await Promise.allSettled(queries.map((q) => fetchRSSQuery(q)));
+
+  const merged: NewsItem[] = [];
+  for (const r of results) {
+    if (r.status === "fulfilled") merged.push(...r.value);
+  }
+
+  const map = new Map<string, NewsItem>();
+  for (const item of merged) {
+    const key = item.url;
+    const existing = map.get(key);
+    if (!existing) map.set(key, item);
+    else if (existing.publishedAtISO < item.publishedAtISO) map.set(key, item);
+  }
+
+  return Array.from(map.values());
 }
 
 function Card({
@@ -232,16 +266,13 @@ export default function LatestReports() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Defaults: End=today, Start=today-7
   const [endDate, setEndDate] = useState<string>(() => todayISODate());
   const [startDate, setStartDate] = useState<string>(() => {
     const end = todayISODate();
     return daysBeforeISO(end, 7);
   });
 
-  // ✅ NEW: Company filter (dropdown)
   const [company, setCompany] = useState<string>("All");
-
   const todayMax = todayISODate();
 
   useEffect(() => {
@@ -264,7 +295,7 @@ export default function LatestReports() {
         const t = new Date(n.publishedAtISO).getTime();
         if (!Number.isFinite(t) || t < fromT || t > toT) return false;
 
-        if (patterns.length === 0) return true; // "All"
+        if (patterns.length === 0) return true;
 
         const hay = `${n.title} ${n.snippet} ${n.source}`.toLowerCase();
         return patterns.some((p) => hay.includes(p));
@@ -286,11 +317,14 @@ export default function LatestReports() {
         }
       }
 
-      const raw = await fetchGoogleNewsRSS();
-      const relevant = raw.filter(isRelevantReport).slice(0, 100);
+      const raw = await fetchReportsMultiQuery();
+      const relevant = raw.filter(isRelevantReport);
 
-      setItems(relevant);
-      saveCache(relevant);
+      relevant.sort((a, b) => (a.publishedAtISO < b.publishedAtISO ? 1 : -1));
+      const limited = relevant.slice(0, 200);
+
+      setItems(limited);
+      saveCache(limited);
     } catch {
       setError("Unable to load reports – please try again later");
     } finally {
@@ -354,7 +388,6 @@ export default function LatestReports() {
               </div>
             }
           >
-            {/* ✅ Same grid structure; we extend from 3 to 4 columns on larger screens */}
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-4 sm:items-end">
               <div>
                 <div className="text-xs font-medium text-slate-600">Start date</div>
@@ -389,7 +422,6 @@ export default function LatestReports() {
                 />
               </div>
 
-              {/* ✅ NEW: Company dropdown */}
               <div>
                 <div className="text-xs font-medium text-slate-600">Company</div>
                 <select
@@ -414,7 +446,8 @@ export default function LatestReports() {
           </Card>
         </div>
 
-        {error ? (
+        {/* ✅ Show error only when nothing to display */}
+        {error && filtered.length === 0 ? (
           <div className="mt-6 rounded-2xl bg-rose-50 p-4 text-rose-800 ring-1 ring-rose-200">
             <div className="font-semibold">{error}</div>
             <button
@@ -451,7 +484,9 @@ export default function LatestReports() {
                     {a.title}
                   </a>
                   <a href={a.url} target="_blank" rel="noreferrer" title="Open">
-                    <ExternalIcon />
+                    <span className="inline-flex h-5 w-5 items-center justify-center rounded-md bg-slate-100 text-slate-600">
+                      ↗
+                    </span>
                   </a>
                 </div>
 
