@@ -2,6 +2,7 @@ import React from "react";
 import { Tabs, TabList, Tab, TabPanel } from "react-tabs";
 import "react-tabs/style/react-tabs.css";
 import ElectricityDashboard from "./ElectricityDashboard";
+import RatedCapacity from "./RatedCapacity";
 
 export default function App() {
   return (
@@ -17,6 +18,7 @@ export default function App() {
               <Tab>Supply</Tab>
               <Tab>Coal PLF</Tab>
               <Tab>RTM Prices</Tab>
+              <Tab>Rated Capacity</Tab>
             </TabList>
           </div>
 
@@ -117,6 +119,10 @@ export default function App() {
                 decimals: 2,
               }}
             />
+          </TabPanel>
+
+          <TabPanel>
+            <RatedCapacity />
           </TabPanel>
         </Tabs>
       </div>
